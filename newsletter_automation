@@ -1,0 +1,335 @@
+/***** CONFIG *****/
+const CONFIG = {
+  NEWSLETTER_LABEL: 'Newsletter',
+  TARGET_EMAIL: 'sidharth.bedi@gmail.com',
+  DIGEST_SUBJECT_PREFIX: '📰 Daily Newsletter Digest',
+  LOOKBACK_HOURS: 24,
+
+  // OpenAI-compatible HF Router
+  LLM_ENDPOINT: 'https://router.huggingface.co/v1/chat/completions',
+  LLM_API_KEY: PropertiesService.getScriptProperties().getProperty('HF_API_KEY'),
+
+  // Try these in order; the first that works will be used
+  LLM_MODELS: [
+    'meta-llama/Llama-3.1-8B-Instruct:cerebras',
+    'google/gemma-2-9b-it:together',
+    'HuggingFaceH4/zephyr-7b-beta:cohere'
+  ],
+
+  MAX_CHARS_PER_CHUNK: 6000,
+  MAX_THREADS: 60
+};
+
+
+/***** ENTRYPOINT *****/
+function runNewsletterDigest() {
+  Logger.log("Loaded Key Starts With: " + (CONFIG.LLM_API_KEY || '').slice(0,3));
+  const sinceDate = new Date(Date.now() - CONFIG.LOOKBACK_HOURS * 3600 * 1000);
+  const {threads, skippedCount} = fetchNewsletterThreadsSince(sinceDate);
+  if (!threads.length) {
+    Logger.log('No newsletters found in window.');
+    return;
+  }
+
+  const chunks = [];
+  for (let i = 0; i < threads.length; i++) {
+    const t = threads[i];
+    const text = extractReadableText(t);
+    if (!text) continue;
+
+    const header = buildHeaderLine(t);
+    const split = chunkText(header + '\n\n' + text, CONFIG.MAX_CHARS_PER_CHUNK);
+    split.forEach(s => chunks.push(s));
+  }
+
+  const perChunkSummaries = summarizeInBatches(chunks);        // returns array of {title, source, link?, bullets[]}
+  const finalDigest = composeFinalDigest(perChunkSummaries, sinceDate, skippedCount, threads.length);
+
+  MailApp.sendEmail({
+    to: CONFIG.TARGET_EMAIL,
+    subject: `${CONFIG.DIGEST_SUBJECT_PREFIX} — ${formatDateIST(new Date())} #${new Date().getTime()}`,
+    htmlBody: finalDigest
+  });
+
+  // Safety: if any outgoing threads were auto-labeled by Gmail filters, remove the Newsletter label from Sent.
+  cleanSentDigestLabels();
+}
+
+
+/***** GMAIL HELPERS *****/
+function fetchNewsletterThreadsSince(sinceDate) {
+  const label = GmailApp.getUserLabelByName(CONFIG.NEWSLETTER_LABEL);
+  if (!label) return {threads: [], skippedCount: 0};
+
+  // EXCLUSIONS:
+  //  - Don’t include Sent mailbox
+  //  - Don’t include anything From me (covers replies/forwards)
+  //  - Don’t include prior digests by subject prefix (belt-and-suspenders)
+  const query =
+    `label:"${CONFIG.NEWSLETTER_LABEL}" after:${toGmailEpoch(sinceDate)} -in:sent -from:me -subject:"${CONFIG.DIGEST_SUBJECT_PREFIX}"`;
+
+  const threads = GmailApp.search(query, 0, CONFIG.MAX_THREADS); // capped for cost control
+  const total = GmailApp.search(query).length;
+  return {threads, skippedCount: Math.max(0, total - threads.length)};
+}
+
+function buildHeaderLine(thread) {
+  const msgs = thread.getMessages();
+  const m = msgs[msgs.length - 1]; // latest
+  const from = m.getFrom();
+  const subj = m.getSubject() || '(no subject)';
+  const link = thread.getPermalink();
+  // keep this compact; we’ll pass to LLM for parsing into JSON
+  return `From: ${from}\nSubject: ${subj}\nLink: ${link}`;
+}
+
+function extractReadableText(thread) {
+  // Prefer the latest message; newsletters usually append updates
+  const msg = thread.getMessages().slice(-1)[0];
+  // Skip if the latest message is from me (extra guard)
+  if (msg.getFrom().toLowerCase().includes(Session.getActiveUser().getEmail().toLowerCase())) return '';
+
+  // Try plain text first
+  let body = msg.getPlainBody();
+  if (!body) {
+    // Fallback: strip HTML
+    const html = msg.getBody();
+    body = stripHtml(html);
+  }
+  // Trim boilerplate
+  body = dropCommonFooters(body);
+  // Avoid empty/too-short blobs
+  return body && body.replace(/\s+/g, ' ').trim().length > 80 ? body : '';
+}
+
+function dropCommonFooters(t) {
+  if (!t) return t;
+  const cutMarkers = [
+    'unsubscribe', 'manage preferences', 'view in browser', 'privacy policy',
+    'update your preferences', 'contact us'
+  ];
+  let cutIndex = -1;
+  const lower = t.toLowerCase();
+  cutMarkers.forEach(m => {
+    const idx = lower.indexOf(m);
+    if (idx !== -1) cutIndex = cutIndex === -1 ? idx : Math.min(cutIndex, idx);
+  });
+  return cutIndex !== -1 ? t.slice(0, cutIndex) : t;
+}
+
+function stripHtml(html) {
+  return HtmlService.createHtmlOutput(html).getContent()
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function toGmailEpoch(d) {
+  // Gmail "after:" accepts yyyy/mm/dd; use IST day boundary
+  const ist = toIST(d);
+  const y = ist.getFullYear();
+  const m = String(ist.getMonth() + 1).padStart(2, '0');
+  const day = String(ist.getDate()).padStart(2, '0');
+  return `${y}/${m}/${day}`;
+}
+
+
+/***** CHUNKING & SUMMARIZATION (now JSON-structured) *****/
+function chunkText(s, maxChars) {
+  const chunks = [];
+  let i = 0;
+  while (i < s.length) {
+    chunks.push(s.slice(i, i + maxChars));
+    i += maxChars;
+  }
+  return chunks;
+}
+
+function summarizeInBatches(chunks) {
+  const results = [];
+  const systemPrompt =
+    "You are a precise editor. Output STRICT JSON only, no markdown, no code fences. " +
+    "Shape: {\"title\": string, \"source\": string, \"link\": string|null, \"bullets\": string[3..6]}." +
+    "Bullets must be crisp, factual, and free of markdown symbols.";
+
+  for (let i = 0; i < chunks.length; i++) {
+    const input = chunks[i];
+    const prompt =
+      "Summarize this newsletter excerpt into the JSON shape above.\n" +
+      "Infer `source` from the header lines (From/Subject). If a Link header exists, set `link` to that URL, else null.\n" +
+      "Do not include markdown like **bold** or lists. No prose outside JSON.\n\n" +
+      input;
+
+    const jsonText = callLLM(systemPrompt, prompt);
+    if (!jsonText) continue;
+
+    const parsed = parseLooseJson(jsonText);
+    if (parsed && parsed.title && Array.isArray(parsed.bullets)) {
+      results.push(parsed);
+    } else {
+      // Fallback: package as a generic card with sanitized text
+      results.push({
+        title: 'Untitled',
+        source: '',
+        link: null,
+        bullets: [jsonText.replace(/\*\*/g, '').replace(/^- /gm, '').trim().slice(0, 600)]
+      });
+    }
+    Utilities.sleep(400); // gentle rate limit
+  }
+  return results;
+}
+
+function callLLM(systemPrompt, userPrompt) {
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user',   content: userPrompt }
+  ];
+
+  for (var i = 0; i < CONFIG.LLM_MODELS.length; i++) {
+    var model = CONFIG.LLM_MODELS[i];
+
+    var payload = {
+      model: model,
+      messages: messages,
+      temperature: 0.2,
+      max_tokens: 400
+    };
+
+    var resp = UrlFetchApp.fetch(CONFIG.LLM_ENDPOINT, {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + CONFIG.LLM_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+
+    var code = resp.getResponseCode();
+    if (code === 404 || code === 400) {
+      Logger.log('HF router error ' + code + ' for model ' + model + ': ' + resp.getContentText());
+      continue; // try next provider-backed model
+    }
+    if (code === 401) {
+      Logger.log('HF router error 401: invalid credentials');
+      return '';
+    }
+    if (code < 200 || code >= 300) {
+      Logger.log('HF router error: ' + code + ' ' + resp.getContentText());
+      return '';
+    }
+
+    var data = JSON.parse(resp.getContentText());
+    var content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (content) return content.trim();
+  }
+
+  Logger.log('All HF models failed. Check token permissions and provider availability.');
+  return '';
+}
+
+/***** JSON helpers *****/
+function parseLooseJson(s) {
+  // Strip code fences if any slipped through
+  s = s.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/, '');
+  // Attempt to extract the first {...} block
+  const m = s.match(/\{[\s\S]*\}$/);
+  const blob = m ? m[0] : s;
+  try {
+    return JSON.parse(blob);
+  } catch (e) {
+    Logger.log('JSON parse failed; falling back. Raw: ' + s.slice(0, 200));
+    return null;
+  }
+}
+
+
+/***** RENDERING (clean HTML, no markdown artifacts) *****/
+function composeFinalDigest(items, sinceDate, skippedCount, totalThreads) {
+  const dateStr = formatDateIST(new Date());
+  const windowStr = formatDateIST(sinceDate);
+
+  const header = `
+  <div style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; max-width: 760px; margin: 0 auto;">
+    <h2 style="margin: 8px 0 4px;">Daily Newsletter Digest</h2>
+    <div style="color:#555; font-size:13px; margin-bottom:12px;">
+      <span><b>Generated:</b> ${dateStr} IST</span> ·
+      <span><b>Window start:</b> ${windowStr} IST</span> ·
+      <span><b>Sources summarized:</b> ${totalThreads}${skippedCount ? ` (capped; +${skippedCount} skipped)` : ''}</span>
+    </div>
+    <hr style="border:none;border-top:1px solid #eee; margin:12px 0;">
+  </div>`;
+
+  const cards = (items && items.length)
+    ? items.map(renderCard).join('')
+    : `<div style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; max-width:760px; margin:0 auto;">No content summarized in this window.</div>`;
+
+  const footer = `
+  <div style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; max-width:760px; margin: 0 auto;">
+    <hr style="border:none;border-top:1px solid #eee; margin:12px 0;">
+    <div style="color:#666;font-size:12px;">
+      Auto-generated. Reply with “STOP” to pause this digest.
+    </div>
+  </div>`;
+
+  return header + cards + footer;
+}
+
+function renderCard(item) {
+  const esc = escapeHtml;
+  const title = esc(item.title || 'Untitled');
+  const source = item.source ? esc(item.source) : '';
+  const link = (item.link && typeof item.link === 'string') ? item.link : null;
+  const meta = [source, link ? `<a href="${esc(link)}" style="text-decoration:none;">Source link</a>` : '']
+      .filter(Boolean).join(' · ');
+
+  const bulletsHtml = (item.bullets || []).map(b => `<li>${esc(b)}</li>`).join('');
+
+  return `
+  <div style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; max-width:760px; margin: 0 auto 16px;">
+    <div style="border:1px solid #eee; border-radius:10px; padding:12px 14px;">
+      <div style="display:flex; justify-content:space-between; align-items:baseline; gap:12px;">
+        <h3 style="margin:0 0 6px; font-size:16px;">${title}</h3>
+      </div>
+      ${meta ? `<div style="color:#666; font-size:12px; margin-bottom:6px;">${meta}</div>` : ''}
+      <ul style="margin:6px 0 0 18px; padding:0;">${bulletsHtml}</ul>
+    </div>
+  </div>`;
+}
+
+
+/***** UTILITIES *****/
+function toIST(d) {
+  const tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  // Keep a Date object but normalized via formatter to IST text → re-parsed
+  return new Date(Utilities.formatDate(d, tz, 'MMM d, yyyy HH:mm:ss'));
+}
+
+function formatDateIST(d) {
+  const tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  return Utilities.formatDate(d, tz, 'MMM d, yyyy HH:mm');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+
+/***** LABEL CLEANUP (ensure Sent mail is not labeled as Newsletter) *****/
+function cleanSentDigestLabels() {
+  const label = GmailApp.getUserLabelByName(CONFIG.NEWSLETTER_LABEL);
+  if (!label) return;
+  // Only look in Sent
+  const threads = GmailApp.search(`in:sent label:"${CONFIG.NEWSLETTER_LABEL}"`);
+  threads.forEach(t => t.removeLabel(label));
+}
+
+
+/***** SECURITY NOTE *****/
+// Store API keys in Script Properties: Project Settings → Script properties → add HF_API_KEY
+// Then read with: PropertiesService.getScriptProperties().getProperty('HF_API_KEY')
+
