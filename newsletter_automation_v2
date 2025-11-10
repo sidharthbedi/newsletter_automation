@@ -1,4 +1,5 @@
 /***** CONFIG *****/
+/* v2 */
 const CONFIG = {
   NEWSLETTER_LABEL: 'Newsletter',
   TARGET_EMAIL: 'sidharth.bedi@gmail.com',
